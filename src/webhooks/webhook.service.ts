@@ -2,18 +2,19 @@ import { ConflictException, Injectable, NotFoundException, UnauthorizedException
 import { createHmac, timingSafeEqual } from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { ReceiveWebhookDto } from './webhook.dto';
+import { WebhookStore } from './webhook.store';
 import { DeliveryAttempt, WebhookEvent } from './webhook.types';
 
 @Injectable()
 export class WebhookService {
-  private readonly events = new Map<string, WebhookEvent>();
-  private readonly eventIds = new Map<string, string>();
   private readonly secret = process.env.WEBHOOK_SECRET ?? 'local-development-secret';
-  private readonly maxAttempts = 5;
+  private readonly maxAttempts = Number(process.env.MAX_DELIVERY_ATTEMPTS ?? 5);
+
+  constructor(private readonly store: WebhookStore) {}
 
   receive(dto: ReceiveWebhookDto, signature: string | undefined): WebhookEvent {
     this.verifySignature(dto.payload, signature);
-    if (this.eventIds.has(dto.eventId)) {
+    if (this.store.findByEventId(dto.eventId)) {
       throw new ConflictException('Duplicate eventId');
     }
 
@@ -27,13 +28,11 @@ export class WebhookService {
       receivedAt: new Date().toISOString(),
       attempts: [],
     };
-    this.events.set(event.id, event);
-    this.eventIds.set(event.eventId, event.id);
-    return event;
+    return this.store.save(event);
   }
 
   get(id: string): WebhookEvent {
-    const event = this.events.get(id);
+    const event = this.store.findById(id);
     if (!event) throw new NotFoundException('Webhook event not found');
     return event;
   }
@@ -62,13 +61,13 @@ export class WebhookService {
     }
 
     event.attempts.push(attempt);
-    return event;
+    return this.store.save(event);
   }
 
   replay(id: string): WebhookEvent {
     const event = this.get(id);
     event.status = 'PENDING';
-    return event;
+    return this.store.save(event);
   }
 
   private verifySignature(payload: Record<string, unknown>, signature?: string): void {
