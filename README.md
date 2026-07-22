@@ -1,57 +1,57 @@
 # Webhook Reliability Gateway
 
-A small production-style backend service built with **TypeScript and NestJS** that makes webhook ingestion and delivery safer.
+A production-style backend service built with **TypeScript and NestJS** that accepts signed webhooks and delivers them reliably to downstream services.
 
 ## Problem
 
-Webhook systems often fail in predictable ways:
+Webhook delivery commonly fails because events are duplicated, consumers are temporarily unavailable, permanent errors are retried blindly, and failed deliveries are difficult to inspect or replay.
 
-- the same event is delivered multiple times
-- downstream services return temporary failures
-- permanent failures are retried unnecessarily
-- teams cannot easily inspect delivery history
-- failed events are difficult to replay safely
+This project provides a small reliability layer between webhook producers and downstream consumers.
 
-This project provides a simple reliability layer between webhook producers and downstream consumers.
+## Features
 
-## What It Does
-
-- verifies HMAC-SHA256 webhook signatures
-- rejects duplicate `eventId` values
-- stores webhook events and delivery attempts
-- retries `408`, `429`, and `5xx` responses
-- uses exponential backoff for temporary failures
-- moves permanent or exhausted failures to a dead-letter state
-- exposes a manual replay endpoint
-- documents the API with Swagger
+- HMAC-SHA256 signature verification
+- duplicate prevention using a unique `eventId`
+- durable local JSON persistence across restarts
+- automatic background HTTP delivery
+- configurable delivery timeout and polling interval
+- retries for `408`, `429`, and `5xx` responses
+- exponential backoff
+- dead-letter state after permanent or exhausted failures
+- complete delivery-attempt history
+- manual replay endpoint
+- Swagger/OpenAPI documentation
+- Jest tests, Docker, and GitHub Actions CI
 
 ## Architecture
 
 ```text
 Webhook Producer
-       |
-       v
+      |
+      v
 POST /api/v1/webhooks
-       |
-       +--> Verify HMAC signature
-       +--> Reject duplicate eventId
-       +--> Persist event
-       |
-       v
-Delivery Attempt API
-       |
-       +--> 2xx       -> DELIVERED
-       +--> 408/429/5xx -> RETRYING
-       +--> 4xx       -> DEAD_LETTER
-       +--> max attempts reached -> DEAD_LETTER
+      |
+      +--> Verify HMAC signature
+      +--> Reject duplicate eventId
+      +--> Persist event to durable store
+      |
+      v
+Background Delivery Worker
+      |
+      +--> POST payload to destination URL
+      +--> 2xx          -> DELIVERED
+      +--> 408/429/5xx  -> RETRYING with backoff
+      +--> other 4xx    -> DEAD_LETTER
+      +--> max attempts -> DEAD_LETTER
 ```
 
-The current MVP uses an in-memory repository to keep setup simple. The service boundary is intentionally small so PostgreSQL, Redis, BullMQ, or Kafka can be introduced later without changing the public API.
+The current implementation uses a file-backed repository to stay easy to run while still surviving process restarts. `WebhookStore` provides a clear boundary for replacing it with PostgreSQL or another durable database later.
 
 ## Tech Stack
 
 - TypeScript
 - NestJS
+- Node.js native `fetch`
 - class-validator
 - Swagger/OpenAPI
 - Jest
@@ -61,6 +61,7 @@ The current MVP uses an in-memory repository to keep setup simple. The service b
 ## Run Locally
 
 ```bash
+cp .env.example .env
 npm install
 npm run start:dev
 ```
@@ -71,13 +72,13 @@ Swagger UI:
 http://localhost:3000/docs
 ```
 
-## Generate a Test Signature
-
-The default local secret is:
+Webhook events are stored by default in:
 
 ```text
-local-development-secret
+data/webhooks.json
 ```
+
+## Generate a Test Signature
 
 ```bash
 node -e "const c=require('crypto'); const p={orderId:'order-101',status:'paid'}; console.log(c.createHmac('sha256','local-development-secret').update(JSON.stringify(p)).digest('hex'))"
@@ -100,15 +101,15 @@ curl -X POST http://localhost:3000/api/v1/webhooks \
   }'
 ```
 
-## Record a Delivery Attempt
+The event is persisted immediately. The background worker then attempts delivery to `destinationUrl`.
+
+## Inspect an Event
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/webhooks/<id>/attempts \
-  -H "Content-Type: application/json" \
-  -d '{"statusCode":503,"error":"Downstream unavailable"}'
+curl http://localhost:3000/api/v1/webhooks/<id>
 ```
 
-Temporary failures return `RETRYING` with a calculated `nextRetryAt` value.
+The response includes the current state and every delivery attempt.
 
 ## Replay a Failed Event
 
@@ -116,14 +117,27 @@ Temporary failures return `RETRYING` with a calculated `nextRetryAt` value.
 curl -X POST http://localhost:3000/api/v1/webhooks/<id>/replay
 ```
 
+Replay moves the event back to `PENDING`; the worker picks it up automatically.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `WEBHOOK_SECRET` | `local-development-secret` | HMAC signing secret |
+| `WEBHOOK_DATA_FILE` | `data/webhooks.json` | Durable event-store location |
+| `DELIVERY_POLL_INTERVAL_MS` | `2000` | Worker polling interval |
+| `DELIVERY_TIMEOUT_MS` | `5000` | Outbound request timeout |
+| `MAX_DELIVERY_ATTEMPTS` | `5` | Maximum attempts before dead-lettering |
+
 ## Reliability Decisions
 
-- **HMAC verification** prevents unauthenticated webhook injection.
-- **Unique event IDs** provide idempotent ingestion.
-- **Status-aware retries** avoid retrying permanent client errors.
-- **Exponential backoff** reduces pressure on unhealthy downstream systems.
-- **Dead-letter state** makes failures visible instead of silently dropping them.
-- **Attempt history** helps operators understand what happened.
+- Signature verification prevents unauthenticated event injection.
+- Unique event IDs provide idempotent ingestion.
+- Persist-before-deliver prevents accepted events from disappearing on restart.
+- A single guarded worker loop prevents overlapping scans inside one process.
+- Status-aware retries avoid repeatedly sending permanent client failures.
+- Exponential backoff reduces pressure on unhealthy consumers.
+- Dead-letter state and attempt history make failures visible and replayable.
 
 ## Tests
 
@@ -131,27 +145,28 @@ curl -X POST http://localhost:3000/api/v1/webhooks/<id>/replay
 npm test
 ```
 
-The tests cover signed ingestion, duplicate detection, temporary retries, and dead-letter behavior.
+Tests use isolated temporary durable stores and cover signed ingestion, duplicate detection, retry behavior, and dead-letter handling.
 
 ## Docker
 
 ```bash
 docker build -t webhook-reliability-gateway .
-docker run -p 3000:3000 webhook-reliability-gateway
+docker run -p 3000:3000 -v webhook-data:/app/data webhook-reliability-gateway
 ```
+
+The volume preserves webhook data when the container is recreated.
 
 ## Next Improvements
 
-- PostgreSQL persistence
-- Redis deduplication with TTL
-- BullMQ delivery worker
-- real outbound HTTP delivery
-- configurable retry policies per destination
-- encrypted destination secrets
-- metrics for success rate and retry backlog
-- dead-letter dashboard
+- PostgreSQL persistence with unique constraints
+- Redis distributed locking and deduplication TTL
+- BullMQ for horizontally scalable workers
+- per-destination retry policies
+- outbound webhook signatures
+- encrypted destination credentials
+- Prometheus delivery metrics
 - Testcontainers integration tests
 
 ## Why This Project
 
-This repository demonstrates practical backend concerns that appear in payments, ordering, integrations, and distributed systems: authentication, idempotency, retries, failure classification, observability, and replay safety.
+This repository demonstrates practical backend concerns found in payments, ordering, partner integrations, and distributed systems: authentication, idempotency, durable state, retries, timeouts, failure classification, background processing, observability, and safe replay.
