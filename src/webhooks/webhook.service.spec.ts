@@ -1,6 +1,10 @@
 import { createHmac } from 'crypto';
 import { ConflictException } from '@nestjs/common';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { WebhookService } from './webhook.service';
+import { WebhookStore } from './webhook.store';
 
 const payload = { orderId: 'order-101', status: 'paid' };
 const signature = createHmac('sha256', 'local-development-secret')
@@ -11,7 +15,8 @@ describe('WebhookService', () => {
   let service: WebhookService;
 
   beforeEach(() => {
-    service = new WebhookService();
+    process.env.WEBHOOK_DATA_FILE = join(tmpdir(), `webhooks-${randomUUID()}.json`);
+    service = new WebhookService(new WebhookStore());
   });
 
   it('accepts a signed webhook and rejects duplicate event IDs', () => {
